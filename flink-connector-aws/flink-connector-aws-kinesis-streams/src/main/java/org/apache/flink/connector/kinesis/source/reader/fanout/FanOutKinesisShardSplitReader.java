@@ -26,6 +26,8 @@ import org.apache.flink.connector.kinesis.source.reader.KinesisShardSplitReaderB
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplit;
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplitState;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.services.kinesis.model.SubscribeToShardEvent;
 
 import java.time.Duration;
@@ -38,6 +40,7 @@ import java.util.Map;
  */
 @Internal
 public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
+    private static final Logger LOG = LoggerFactory.getLogger(FanOutKinesisShardSplitReader.class);
     private final AsyncStreamProxy asyncStreamProxy;
     private final String consumerArn;
     private final Duration subscriptionTimeout;
@@ -90,6 +93,19 @@ public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
 
     @Override
     public void close() throws Exception {
-        asyncStreamProxy.close();
+        try {
+            // Close all subscriptions to ensure proper cleanup of resources
+            for (FanOutKinesisShardSubscription subscription : splitSubscriptions.values()) {
+                try {
+                    subscription.close();
+                } catch (Exception e) {
+                    // Log but continue closing other resources
+                    LOG.warn("Error closing subscription", e);
+                }
+            }
+            splitSubscriptions.clear();
+        } finally {
+            asyncStreamProxy.close();
+        }
     }
 }

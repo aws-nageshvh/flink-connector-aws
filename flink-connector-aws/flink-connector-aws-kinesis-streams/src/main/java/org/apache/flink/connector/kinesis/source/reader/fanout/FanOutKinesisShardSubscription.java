@@ -46,6 +46,8 @@ import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -83,6 +85,9 @@ public class FanOutKinesisShardSubscription {
     private final AtomicBoolean subscriptionActive = new AtomicBoolean(false);
     private final AtomicReference<Throwable> subscriptionException = new AtomicReference<>();
 
+    // Executor for handling blocking operations to avoid blocking the Netty event loop thread
+    private final ExecutorService blockingTaskExecutor;
+
     // Store the current starting position for this subscription. Will be updated each time new
     // batch of records is consumed
     private StartingPosition startingPosition;
@@ -99,6 +104,10 @@ public class FanOutKinesisShardSubscription {
         this.shardId = shardId;
         this.startingPosition = startingPosition;
         this.subscriptionTimeout = subscriptionTimeout;
+
+        // Initialize the executor with a named thread factory
+        this.blockingTaskExecutor = Executors.newSingleThreadExecutor(
+            r -> new Thread(r, "kinesis-blocking-task-" + shardId));
     }
 
     /** Method to allow eager activation of the subscription. */
@@ -254,6 +263,7 @@ public class FanOutKinesisShardSubscription {
      */
     private class FanOutShardSubscriber implements Subscriber<SubscribeToShardEventStream> {
         private final CountDownLatch subscriptionLatch;
+        private final AtomicBoolean processingEvent = new AtomicBoolean(false);
 
         private Subscription subscription;
 
@@ -289,33 +299,85 @@ public class FanOutKinesisShardSubscription {
 
         @Override
         public void onNext(SubscribeToShardEventStream subscribeToShardEventStream) {
+            // This method is called on the Netty event loop thread and must not block
             subscribeToShardEventStream.accept(
                     new SubscribeToShardResponseHandler.Visitor() {
                         @Override
                         public void visit(SubscribeToShardEvent event) {
-                            try {
-                                LOG.debug(
-                                        "Received event: {}, {}",
-                                        event.getClass().getSimpleName(),
-                                        event);
-                                eventQueue.put(event);
+                            // Offload the blocking operation to a separate thread
+                            if (!processingEvent.getAndSet(true)) {
+                                blockingTaskExecutor.execute(() -> {
+                                    try {
+                                        LOG.debug(
+                                                "Received event: {}, {}",
+                                                event.getClass().getSimpleName(),
+                                                event);
 
-                                // Update the starting position in case we have to recreate the
-                                // subscription
-                                startingPosition =
-                                        StartingPosition.continueFromSequenceNumber(
+                                        // This will block if the queue is full, but on our dedicated thread
+                                        eventQueue.put(event);
+
+                                        // Update the starting position in case we have to recreate the subscription
+                                        startingPosition = StartingPosition.continueFromSequenceNumber(
                                                 event.continuationSequenceNumber());
 
-                                // Replace the record just consumed in the Queue
-                                requestRecords();
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                                throw new KinesisStreamsSourceException(
-                                        "Interrupted while adding Kinesis record to internal buffer.",
-                                        e);
+                                        // Request next record only after successfully queuing this one
+                                        requestRecords();
+                                    } catch (InterruptedException e) {
+                                        Thread.currentThread().interrupt();
+                                        throw new KinesisStreamsSourceException(
+                                                "Interrupted while adding Kinesis record to internal buffer.",
+                                                e);
+                                    } finally {
+                                        processingEvent.set(false);
+                                    }
+                                });
+                            } else {
+                                // We're already processing an event, so handle this case
+                                LOG.warn("Received event while still processing previous one. " +
+                                        "This indicates potential overload.");
+
+                                // Handle this rare case by offloading to the executor with retry logic
+                                handleConcurrentEvent(event);
                             }
                         }
                     });
+        }
+
+        private void handleConcurrentEvent(SubscribeToShardEvent event) {
+            blockingTaskExecutor.execute(() -> {
+                try {
+                    // Wait until we can process this event
+                    while (processingEvent.get()) {
+                        Thread.sleep(10); // Small sleep to avoid busy waiting
+                    }
+
+                    if (processingEvent.compareAndSet(false, true)) {
+                        try {
+                            LOG.debug(
+                                    "Processing concurrent event: {}, {}",
+                                    event.getClass().getSimpleName(),
+                                    event);
+
+                            eventQueue.put(event);
+                            startingPosition = StartingPosition.continueFromSequenceNumber(
+                                    event.continuationSequenceNumber());
+                            requestRecords();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new KinesisStreamsSourceException(
+                                    "Interrupted while handling concurrent event.",
+                                    e);
+                        } finally {
+                            processingEvent.set(false);
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    terminateSubscription(e);
+                } catch (Exception e) {
+                    terminateSubscription(e);
+                }
+            });
         }
 
         @Override
@@ -332,6 +394,24 @@ public class FanOutKinesisShardSubscription {
             LOG.info("Subscription complete - {} ({})", shardId, consumerArn);
             cancel();
             activateSubscription();
+        }
+    }
+
+    public void close() throws IOException {
+        try {
+            if (blockingTaskExecutor != null) {
+                blockingTaskExecutor.shutdown();
+                try {
+                    if (!blockingTaskExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                        blockingTaskExecutor.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    blockingTaskExecutor.shutdownNow();
+                }
+            }
+        } finally {
+            kinesis.close();
         }
     }
 }
