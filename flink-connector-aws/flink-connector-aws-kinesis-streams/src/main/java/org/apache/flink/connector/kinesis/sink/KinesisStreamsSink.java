@@ -22,6 +22,7 @@ import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.connector.base.sink.AsyncSinkBase;
 import org.apache.flink.connector.base.sink.writer.BufferedRequestState;
 import org.apache.flink.connector.base.sink.writer.ElementConverter;
+import org.apache.flink.connector.kinesis.util.KinesisEventLoopGroups;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.util.Preconditions;
 
@@ -65,7 +66,7 @@ import java.util.Properties;
  * @param <InputT> Type of the elements handled by this sink
  */
 @PublicEvolving
-public class KinesisStreamsSink<InputT> extends AsyncSinkBase<InputT, PutRecordsRequestEntry> {
+public class KinesisStreamsSink<InputT> extends AsyncSinkBase<InputT, PutRecordsRequestEntry> implements AutoCloseable {
 
     private final boolean failOnError;
     private final String streamName;
@@ -149,6 +150,11 @@ public class KinesisStreamsSink<InputT> extends AsyncSinkBase<InputT, PutRecords
     public SimpleVersionedSerializer<BufferedRequestState<PutRecordsRequestEntry>>
             getWriterStateSerializer() {
         return new KinesisStreamsStateSerializer();
+    }
+
+    public void close() {
+        // Close the event loop groups when the sink is closed
+        KinesisEventLoopGroups.closeEventLoopGroups();
     }
 
     @Internal

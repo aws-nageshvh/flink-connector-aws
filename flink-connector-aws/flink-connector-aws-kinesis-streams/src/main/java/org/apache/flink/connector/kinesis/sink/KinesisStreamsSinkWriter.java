@@ -29,12 +29,14 @@ import org.apache.flink.connector.base.sink.writer.config.AsyncSinkWriterConfigu
 import org.apache.flink.connector.base.sink.writer.strategy.AIMDScalingStrategy;
 import org.apache.flink.connector.base.sink.writer.strategy.CongestionControlRateLimitingStrategy;
 import org.apache.flink.connector.base.sink.writer.strategy.RateLimitingStrategy;
+import org.apache.flink.connector.kinesis.util.KinesisEventLoopGroups;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
+import software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient;
 import software.amazon.awssdk.services.kinesis.KinesisAsyncClient;
 import software.amazon.awssdk.services.kinesis.model.PutRecordsRequest;
 import software.amazon.awssdk.services.kinesis.model.PutRecordsRequestEntry;
@@ -167,7 +169,9 @@ class KinesisStreamsSinkWriter<InputT> extends AsyncSinkWriter<InputT, PutRecord
         this.streamArn = streamArn;
         this.metrics = context.metricGroup();
         this.numRecordsOutErrorsCounter = metrics.getNumRecordsOutErrorsCounter();
-        this.httpClient = AWSGeneralUtil.createAsyncHttpClient(kinesisClientProperties);
+        this.httpClient = AWSGeneralUtil.createAsyncHttpClient(
+                kinesisClientProperties,
+                KinesisEventLoopGroups.configureSinkHttpClientBuilder(NettyNioAsyncHttpClient.builder()));
         this.kinesisClient = buildClient(kinesisClientProperties, this.httpClient);
     }
 

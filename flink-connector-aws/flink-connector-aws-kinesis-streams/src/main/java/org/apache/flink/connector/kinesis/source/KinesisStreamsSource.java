@@ -52,6 +52,7 @@ import org.apache.flink.connector.kinesis.source.reader.polling.PollingKinesisSh
 import org.apache.flink.connector.kinesis.source.serialization.KinesisDeserializationSchema;
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplit;
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplitSerializer;
+import org.apache.flink.connector.kinesis.util.KinesisEventLoopGroups;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.util.Preconditions;
@@ -107,7 +108,7 @@ import static org.apache.flink.connector.kinesis.source.config.KinesisSourceConf
  */
 @Experimental
 public class KinesisStreamsSource<T>
-        implements Source<T, KinesisShardSplit, KinesisStreamsSourceEnumeratorState> {
+        implements Source<T, KinesisShardSplit, KinesisStreamsSourceEnumeratorState>, AutoCloseable {
 
     private final String streamArn;
     private final Configuration sourceConfig;
@@ -209,6 +210,11 @@ public class KinesisStreamsSource<T>
         return new KinesisStreamsSourceEnumeratorStateSerializer(new KinesisShardSplitSerializer());
     }
 
+    public void close() {
+        // Close the event loop groups when the source is closed
+        KinesisEventLoopGroups.closeEventLoopGroups();
+    }
+
     private Supplier<SplitReader<Record, KinesisShardSplit>> getKinesisShardSplitReaderSupplier(
             Configuration sourceConfig, Map<String, KinesisShardMetrics> shardMetricGroupMap) {
         KinesisSourceConfigOptions.ReaderType readerType = sourceConfig.get(READER_TYPE);
@@ -272,7 +278,8 @@ public class KinesisStreamsSource<T>
 
         SdkAsyncHttpClient asyncHttpClient =
                 AWSGeneralUtil.createAsyncHttpClient(
-                        AttributeMap.builder().build(), NettyNioAsyncHttpClient.builder());
+                        AttributeMap.builder().build(),
+                        KinesisEventLoopGroups.configureSourceHttpClientBuilder(NettyNioAsyncHttpClient.builder()));
         KinesisAsyncClient kinesisAsyncClient =
                 AWSClientUtil.createAwsAsyncClient(
                         kinesisClientProperties,
