@@ -77,9 +77,9 @@ public class FanOutKinesisShardSubscription {
 
     private final Duration subscriptionTimeout;
 
-    // Queue is meant for eager retrieval of records from the Kinesis stream. We will always have 2
-    // record batches available on next read.
-    private final BlockingQueue<SubscribeToShardEvent> eventQueue = new LinkedBlockingQueue<>(2);
+    // Queue is meant for eager retrieval of records from the Kinesis stream.
+    // Using unbounded queue to prevent blocking when new events arrive
+    private final BlockingQueue<SubscribeToShardEvent> eventQueue = new LinkedBlockingQueue<>();
     private final AtomicBoolean subscriptionActive = new AtomicBoolean(false);
     private final AtomicReference<Throwable> subscriptionException = new AtomicReference<>();
 
@@ -108,6 +108,7 @@ public class FanOutKinesisShardSubscription {
                 shardId,
                 startingPosition,
                 consumerArn);
+        LOG.info("NVH: Initial queue size: {}", eventQueue.size());
         if (subscriptionActive.get()) {
             LOG.warn("Skipping activation of subscription since it is already active.");
             return;
@@ -245,6 +246,7 @@ public class FanOutKinesisShardSubscription {
             return null;
         }
 
+        LOG.info("NVH: Queue size before consumption: {}", eventQueue.size());
         return eventQueue.poll();
     }
 
@@ -299,6 +301,8 @@ public class FanOutKinesisShardSubscription {
                                         event.getClass().getSimpleName(),
                                         event);
                                 eventQueue.put(event);
+
+                                LOG.info("NVH: Queue size after adding event: {}", eventQueue.size());
 
                                 // Update the starting position in case we have to recreate the
                                 // subscription
