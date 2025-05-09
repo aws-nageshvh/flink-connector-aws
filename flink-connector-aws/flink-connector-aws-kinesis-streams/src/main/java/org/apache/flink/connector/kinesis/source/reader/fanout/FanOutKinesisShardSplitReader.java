@@ -26,6 +26,8 @@ import org.apache.flink.connector.kinesis.source.reader.KinesisShardSplitReaderB
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplit;
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplitState;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.services.kinesis.model.SubscribeToShardEvent;
 
 import java.time.Duration;
@@ -38,6 +40,7 @@ import java.util.Map;
  */
 @Internal
 public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
+    private static final Logger LOG = LoggerFactory.getLogger(FanOutKinesisShardSplitReader.class);
     private final AsyncStreamProxy asyncStreamProxy;
     private final String consumerArn;
     private final Duration subscriptionTimeout;
@@ -57,8 +60,17 @@ public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
 
     @Override
     protected RecordBatch fetchRecords(KinesisShardSplitState splitState) {
-        FanOutKinesisShardSubscription subscription =
-                splitSubscriptions.get(splitState.getShardId());
+        String shardId = splitState.getShardId();
+        FanOutKinesisShardSubscription subscription = splitSubscriptions.get(shardId);
+
+        if (subscription == null) {
+            return null;
+        }
+
+        // Check if subscription has events before trying to fetch
+        if (!subscription.hasEvents()) {
+            return null;
+        }
 
         SubscribeToShardEvent event = subscription.nextEvent();
         if (event == null) {
@@ -67,7 +79,7 @@ public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
 
         boolean shardCompleted = event.continuationSequenceNumber() == null;
         if (shardCompleted) {
-            splitSubscriptions.remove(splitState.getShardId());
+            splitSubscriptions.remove(shardId);
         }
         return new RecordBatch(event.records(), event.millisBehindLatest(), shardCompleted);
     }
@@ -75,17 +87,35 @@ public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
     @Override
     public void handleSplitsChanges(SplitsChange<KinesisShardSplit> splitsChanges) {
         super.handleSplitsChanges(splitsChanges);
+
         for (KinesisShardSplit split : splitsChanges.splits()) {
+            String shardId = split.getShardId();
+
             FanOutKinesisShardSubscription subscription =
                     new FanOutKinesisShardSubscription(
                             asyncStreamProxy,
                             consumerArn,
-                            split.getShardId(),
+                            shardId,
                             split.getStartingPosition(),
                             subscriptionTimeout);
+
             subscription.activateSubscription();
             splitSubscriptions.put(split.splitId(), subscription);
         }
+    }
+
+    /**
+     * Returns true if any of the subscriptions has events available.
+     *
+     * @return true if any subscription has events, false otherwise
+     */
+    public boolean hasEvents() {
+        for (Map.Entry<String, FanOutKinesisShardSubscription> entry : splitSubscriptions.entrySet()) {
+            if (entry.getValue().hasEvents()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override

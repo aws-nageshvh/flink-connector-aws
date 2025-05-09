@@ -23,6 +23,7 @@ import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitReader;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitsChange;
 import org.apache.flink.connector.kinesis.source.metrics.KinesisShardMetrics;
+import org.apache.flink.connector.kinesis.source.reader.fanout.FanOutKinesisShardSplitReader;
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplit;
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplitState;
 import org.apache.flink.connector.kinesis.source.split.StartingPosition;
@@ -77,6 +78,15 @@ public abstract class KinesisShardSplitReaderBase
         if (pausedSplitIds.contains(splitState.getSplitId())) {
             assignedSplits.add(splitState);
             return INCOMPLETE_SHARD_EMPTY_RECORDS;
+        }
+
+        // Check if this is a FanOutKinesisShardSplitReader and if it has events
+        if (this instanceof FanOutKinesisShardSplitReader) {
+            FanOutKinesisShardSplitReader fanOutReader = (FanOutKinesisShardSplitReader) this;
+            if (!fanOutReader.hasEvents()) {
+                assignedSplits.add(splitState);
+                return INCOMPLETE_SHARD_EMPTY_RECORDS;
+            }
         }
 
         RecordBatch recordBatch;

@@ -19,6 +19,7 @@
 package org.apache.flink.connector.kinesis.source.reader.fanout;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
 import org.apache.flink.connector.kinesis.source.exception.KinesisStreamsSourceException;
 import org.apache.flink.connector.kinesis.source.proxy.AsyncStreamProxy;
 import org.apache.flink.connector.kinesis.source.split.StartingPosition;
@@ -43,10 +44,8 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -77,9 +76,12 @@ public class FanOutKinesisShardSubscription {
 
     private final Duration subscriptionTimeout;
 
-    // Queue is meant for eager retrieval of records from the Kinesis stream. We will always have 2
-    // record batches available on next read.
-    private final BlockingQueue<SubscribeToShardEvent> eventQueue = new LinkedBlockingQueue<>(2);
+    // Queue is meant for eager retrieval of records from the Kinesis stream.
+    // Using FutureCompletingBlockingQueue for proper notification between producer and consumer
+    private final FutureCompletingBlockingQueue<SubscribeToShardEvent> eventQueue;
+
+    // Thread index for the producer (subscriber)
+    private static final int PRODUCER_THREAD_INDEX = 0;
     private final AtomicBoolean subscriptionActive = new AtomicBoolean(false);
     private final AtomicReference<Throwable> subscriptionException = new AtomicReference<>();
 
@@ -99,6 +101,9 @@ public class FanOutKinesisShardSubscription {
         this.shardId = shardId;
         this.startingPosition = startingPosition;
         this.subscriptionTimeout = subscriptionTimeout;
+
+        // Create a bounded queue with capacity 2
+        this.eventQueue = new FutureCompletingBlockingQueue<>(2);
     }
 
     /** Method to allow eager activation of the subscription. */
@@ -245,7 +250,33 @@ public class FanOutKinesisShardSubscription {
             return null;
         }
 
-        return eventQueue.poll();
+        SubscribeToShardEvent event = eventQueue.poll();
+
+        // Request next batch of records after consumption
+        if (event != null && shardSubscriber != null) {
+            shardSubscriber.requestRecords();
+        }
+
+        return event;
+    }
+
+    /**
+     * Returns the availability future for the event queue. This can be used by consumers
+     * to be notified when new events are available.
+     *
+     * @return a future that completes when events are available
+     */
+    public CompletableFuture<Void> getAvailabilityFuture() {
+        return eventQueue.getAvailabilityFuture();
+    }
+
+    /**
+     * Checks if there are events available in the queue.
+     *
+     * @return true if the queue is not empty, false otherwise
+     */
+    public boolean hasEvents() {
+        return !eventQueue.isEmpty();
     }
 
     /**
@@ -298,7 +329,14 @@ public class FanOutKinesisShardSubscription {
                                         "Received event: {}, {}",
                                         event.getClass().getSimpleName(),
                                         event);
-                                eventQueue.put(event);
+
+                                // Use put with thread index
+                                boolean added = eventQueue.put(PRODUCER_THREAD_INDEX, event);
+
+                                if (!added) {
+                                    LOG.warn("Failed to add event to queue due to wakeup, will retry on next event");
+                                    return;
+                                }
 
                                 // Update the starting position in case we have to recreate the
                                 // subscription
@@ -306,8 +344,7 @@ public class FanOutKinesisShardSubscription {
                                         StartingPosition.continueFromSequenceNumber(
                                                 event.continuationSequenceNumber());
 
-                                // Replace the record just consumed in the Queue
-                                requestRecords();
+                                // Don't request records here - we'll request after consumption
                             } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
                                 throw new KinesisStreamsSourceException(
