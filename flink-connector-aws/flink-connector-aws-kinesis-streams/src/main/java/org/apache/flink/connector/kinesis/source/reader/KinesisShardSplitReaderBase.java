@@ -146,8 +146,22 @@ public abstract class KinesisShardSplitReaderBase
 
     @Override
     public void handleSplitsChanges(SplitsChange<KinesisShardSplit> splitsChanges) {
+        // Always add the splits to the assigned splits queue
         for (KinesisShardSplit split : splitsChanges.splits()) {
             assignedSplits.add(new KinesisShardSplitState(split));
+        }
+    }
+
+    /**
+     * Handle splits to remove by cancelling their subscriptions.
+     * This method should be called when splits need to be removed.
+     *
+     * @param splitsToRemove the splits to remove
+     */
+    public void handleSplitsToRemove(Collection<KinesisShardSplit> splitsToRemove) {
+        // Only FanOutKinesisShardSplitReader needs special handling for split removal
+        if (this instanceof FanOutKinesisShardSplitReader) {
+            ((FanOutKinesisShardSplitReader) this).handleSplitsToRemove(splitsToRemove);
         }
     }
 
@@ -160,8 +174,20 @@ public abstract class KinesisShardSplitReaderBase
     public void pauseOrResumeSplits(
             Collection<KinesisShardSplit> splitsToPause,
             Collection<KinesisShardSplit> splitsToResume) {
-        splitsToPause.forEach(split -> pausedSplitIds.add(split.splitId()));
-        splitsToResume.forEach(split -> pausedSplitIds.remove(split.splitId()));
+        // For splits to pause, we need to add them to the paused set and potentially cancel subscriptions
+        for (KinesisShardSplit split : splitsToPause) {
+            pausedSplitIds.add(split.splitId());
+        }
+
+        // For splits to resume, we just remove them from the paused set
+        for (KinesisShardSplit split : splitsToResume) {
+            pausedSplitIds.remove(split.splitId());
+        }
+
+        // If this is a FanOutKinesisShardSplitReader, handle paused splits specially
+        if (this instanceof FanOutKinesisShardSplitReader) {
+            handleSplitsToRemove(splitsToPause);
+        }
     }
 
     /**

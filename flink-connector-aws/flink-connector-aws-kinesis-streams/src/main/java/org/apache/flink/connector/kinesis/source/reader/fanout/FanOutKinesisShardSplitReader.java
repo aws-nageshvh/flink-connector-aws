@@ -31,6 +31,7 @@ import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.services.kinesis.model.SubscribeToShardEvent;
 
 import java.time.Duration;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -120,6 +121,27 @@ public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
 
     @Override
     public void close() throws Exception {
+        // Wake up any blocked producer threads in all subscriptions
+        for (FanOutKinesisShardSubscription subscription : splitSubscriptions.values()) {
+            subscription.cancelSubscription();
+        }
+
+        // Then close resources
         asyncStreamProxy.close();
+    }
+
+    /**
+     * Handles splits to remove by cancelling their subscriptions and waking up any blocked threads.
+     *
+     * @param splitsToRemove the splits to remove
+     */
+    public void handleSplitsToRemove(Collection<KinesisShardSplit> splitsToRemove) {
+        for (KinesisShardSplit split : splitsToRemove) {
+            FanOutKinesisShardSubscription subscription = splitSubscriptions.get(split.splitId());
+            if (subscription != null) {
+                subscription.cancelSubscription();
+                splitSubscriptions.remove(split.splitId());
+            }
+        }
     }
 }

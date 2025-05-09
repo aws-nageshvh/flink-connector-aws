@@ -24,6 +24,7 @@ import org.apache.flink.connector.kinesis.source.exception.KinesisStreamsSourceE
 import org.apache.flink.connector.kinesis.source.proxy.AsyncStreamProxy;
 import org.apache.flink.connector.kinesis.source.split.StartingPosition;
 import org.apache.flink.util.ExceptionUtils;
+import org.apache.flink.util.concurrent.ExecutorThreadFactory;
 
 import io.netty.handler.timeout.ReadTimeoutException;
 import org.reactivestreams.Subscriber;
@@ -46,6 +47,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -70,6 +73,9 @@ public class FanOutKinesisShardSubscription {
                     IOException.class,
                     LimitExceededException.class);
 
+    /** Default timeout for putting elements into the queue. */
+    private static final Duration DEFAULT_PUT_TIMEOUT = Duration.ofSeconds(10);
+
     private final AsyncStreamProxy kinesis;
     private final String consumerArn;
     private final String shardId;
@@ -84,6 +90,12 @@ public class FanOutKinesisShardSubscription {
     private static final int PRODUCER_THREAD_INDEX = 0;
     private final AtomicBoolean subscriptionActive = new AtomicBoolean(false);
     private final AtomicReference<Throwable> subscriptionException = new AtomicReference<>();
+
+    // Flag to indicate if we're experiencing backpressure
+    private final AtomicBoolean backpressureActive = new AtomicBoolean(false);
+
+    // Scheduler for timeout-based operations
+    private final ScheduledExecutorService scheduler;
 
     // Store the current starting position for this subscription. Will be updated each time new
     // batch of records is consumed
@@ -104,6 +116,10 @@ public class FanOutKinesisShardSubscription {
 
         // Create a bounded queue with capacity 2
         this.eventQueue = new FutureCompletingBlockingQueue<>(2);
+
+        // Create a scheduler for timeout operations
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(
+                new ExecutorThreadFactory("kinesis-subscription-timeout-" + shardId));
     }
 
     /** Method to allow eager activation of the subscription. */
@@ -252,10 +268,15 @@ public class FanOutKinesisShardSubscription {
 
         SubscribeToShardEvent event = eventQueue.poll();
 
-        // Request next batch of records after consumption
-        if (event != null && shardSubscriber != null) {
-            shardSubscriber.requestRecords();
+        // If we got an event and backpressure was active, we can deactivate it now
+        if (event != null && backpressureActive.compareAndSet(true, false)) {
+            LOG.info("Backpressure relieved for shard {}", shardId);
         }
+
+        // Request next batch of records after consumption
+        // if (event != null && shardSubscriber != null && !backpressureActive.get()) {
+        //    shardSubscriber.requestRecords();
+        //}
 
         return event;
     }
@@ -280,6 +301,42 @@ public class FanOutKinesisShardSubscription {
     }
 
     /**
+     * Wakes up the producer thread if it's blocked in putting elements into the queue.
+     * This is typically called during shutdown or when a split is being cancelled.
+     */
+    public void wakeUpProducer() {
+        LOG.info("Waking up producer thread for shard {}", shardId);
+        eventQueue.wakeUpPuttingThread(PRODUCER_THREAD_INDEX);
+    }
+
+    /**
+     * Cancels the subscription and wakes up any blocked producer threads.
+     */
+    public void cancelSubscription() {
+        LOG.info("NVH: Cancelling subscription to shard {} for consumer {}", shardId, consumerArn);
+
+        // Wake up any blocked producer threads
+        wakeUpProducer();
+
+        // Then cancel the subscription
+        if (shardSubscriber != null) {
+            shardSubscriber.cancel();
+        }
+
+        // Shut down the scheduler
+        scheduler.shutdownNow();
+    }
+
+    /**
+     * Gets the event queue for this subscription.
+     *
+     * @return the event queue
+     */
+    public FutureCompletingBlockingQueue<SubscribeToShardEvent> getEventQueue() {
+        return eventQueue;
+    }
+
+    /**
      * Implementation of {@link Subscriber} to retrieve events from Kinesis stream using Reactive
      * Streams.
      */
@@ -293,14 +350,19 @@ public class FanOutKinesisShardSubscription {
         }
 
         public void requestRecords() {
-            subscription.request(1);
+            if (!backpressureActive.get()) {
+                subscription.request(1);
+            } else {
+                LOG.debug("Skipping record request due to active backpressure for shard {}", shardId);
+            }
         }
 
         public void cancel() {
             if (!subscriptionActive.get()) {
-                LOG.warn("Trying to cancel inactive subscription. Ignoring.");
+                LOG.warn("NVH: Trying to cancel inactive subscription. Ignoring.");
                 return;
             }
+            LOG.info("NVH: Cancelling subscription to shard {} for consumer {}", shardId, consumerArn);
             subscriptionActive.set(false);
             if (subscription != null) {
                 subscription.cancel();
@@ -330,21 +392,8 @@ public class FanOutKinesisShardSubscription {
                                         event.getClass().getSimpleName(),
                                         event);
 
-                                // Use put with thread index
-                                boolean added = eventQueue.put(PRODUCER_THREAD_INDEX, event);
-
-                                if (!added) {
-                                    LOG.warn("Failed to add event to queue due to wakeup, will retry on next event");
-                                    return;
-                                }
-
-                                // Update the starting position in case we have to recreate the
-                                // subscription
-                                startingPosition =
-                                        StartingPosition.continueFromSequenceNumber(
-                                                event.continuationSequenceNumber());
-
-                                // Don't request records here - we'll request after consumption
+                                // Try to put the event with a timeout
+                                putWithTimeout(event, DEFAULT_PUT_TIMEOUT);
                             } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
                                 throw new KinesisStreamsSourceException(
@@ -353,6 +402,58 @@ public class FanOutKinesisShardSubscription {
                             }
                         }
                     });
+        }
+
+        /**
+         * Puts an event into the queue with a timeout. If the timeout expires, it wakes up the
+         * producer thread and activates backpressure.
+         *
+         * @param event the event to put
+         * @param timeout the timeout duration
+         * @throws InterruptedException if the thread is interrupted
+         */
+        private void putWithTimeout(SubscribeToShardEvent event, Duration timeout) throws InterruptedException {
+            // Schedule a task to wake up the producer thread after the timeout
+            ScheduledExecutorService scheduler = FanOutKinesisShardSubscription.this.scheduler;
+            final CompletableFuture<Void> timeoutFuture = new CompletableFuture<>();
+
+            // Schedule a task to wake up the producer thread after the timeout
+            scheduler.schedule(() -> {
+                LOG.warn("NVH: Put timeout expired for shard {}, waking up producer thread", shardId);
+                eventQueue.wakeUpPuttingThread(PRODUCER_THREAD_INDEX);
+                timeoutFuture.complete(null);
+                return null;
+            }, timeout.toMillis(), TimeUnit.MILLISECONDS);
+
+            try {
+                // Try to put the event
+                boolean added = eventQueue.put(PRODUCER_THREAD_INDEX, event);
+
+                // Cancel the timeout task if we succeeded or failed
+                timeoutFuture.cancel(false);
+
+                if (!added) {
+                    LOG.warn("NVH: Failed to add event to queue for shard {} due to wakeup", shardId);
+
+                    // Activate backpressure to stop requesting more records
+                    if (backpressureActive.compareAndSet(false, true)) {
+                        LOG.info("NVH: Activating backpressure for shard {}", shardId);
+                    }
+
+                    return;
+                }
+
+                // Update the starting position in case we have to recreate the subscription
+                startingPosition = StartingPosition.continueFromSequenceNumber(
+                        event.continuationSequenceNumber());
+
+                shardSubscriber.requestRecords();
+
+                // Don't request records here - we'll request after consumption
+            } finally {
+                // Make sure we cancel the timeout task
+                timeoutFuture.cancel(false);
+            }
         }
 
         @Override
