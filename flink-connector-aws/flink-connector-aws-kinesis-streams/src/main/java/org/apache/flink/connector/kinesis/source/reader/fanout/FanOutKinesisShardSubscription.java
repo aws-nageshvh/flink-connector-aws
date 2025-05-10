@@ -245,7 +245,30 @@ public class FanOutKinesisShardSubscription {
             return null;
         }
 
-        return eventQueue.poll();
+        SubscribeToShardEvent event = eventQueue.poll();
+        if (event != null) {
+            LOG.warn(
+                    "NVH: Retrieved event from queue for shard {}. Records={}, " +
+                    "Queue size now: {}/{}",
+                    shardId,
+                    event.records().size(),
+                    eventQueue.size(),
+                    eventQueue.size() + eventQueue.remainingCapacity());
+        } else {
+            try {
+                Thread.sleep(5);
+                LOG.warn(
+                    "NVH: No event available in queue for shard {}. Queue size: {}/{}",
+                    shardId,
+                    eventQueue.size(),
+                    eventQueue.size() + eventQueue.remainingCapacity());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOG.warn("Error logging eventQueue capacity", e);
+            }
+        }
+
+        return event;
     }
 
     /**
@@ -298,16 +321,33 @@ public class FanOutKinesisShardSubscription {
                                         "Received event: {}, {}",
                                         event.getClass().getSimpleName(),
                                         event);
-                                eventQueue.put(event);
 
-                                // Update the starting position in case we have to recreate the
-                                // subscription
-                                startingPosition =
-                                        StartingPosition.continueFromSequenceNumber(
-                                                event.continuationSequenceNumber());
+                                // Try to add to queue non-blockingly
+                                if (!eventQueue.offer(event)) {
+                                    LOG.warn(
+                                        "NVH: Unable to add event to queue for shard {}. Queue size now: {}/{}",
+                                        shardId,
+                                        eventQueue.size(),
+                                        eventQueue.size() + eventQueue.remainingCapacity());
+                                        Thread.sleep(10);
+                                    return;
+                                } else {
+                                    eventQueue.put(event);
 
-                                // Replace the record just consumed in the Queue
-                                requestRecords();
+                                    LOG.warn(
+                                        "NVH: Added event to queue for shard {}. Queue size now: {}/{}",
+                                        shardId,
+                                        eventQueue.size(),
+                                        eventQueue.size() + eventQueue.remainingCapacity());
+                                    // Update the starting position in case we have to recreate the
+                                    // subscription
+                                    startingPosition =
+                                            StartingPosition.continueFromSequenceNumber(
+                                                    event.continuationSequenceNumber());
+
+                                    // Replace the record just consumed in the Queue
+                                    requestRecords();
+                                }
                             } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
                                 throw new KinesisStreamsSourceException(

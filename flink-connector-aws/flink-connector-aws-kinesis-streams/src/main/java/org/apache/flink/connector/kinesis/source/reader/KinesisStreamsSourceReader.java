@@ -36,6 +36,9 @@ import software.amazon.awssdk.services.kinesis.model.Record;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Coordinates the reading from assigned splits. Runs on the TaskManager.
@@ -49,6 +52,7 @@ public class KinesisStreamsSourceReader<T>
 
     private static final Logger LOG = LoggerFactory.getLogger(KinesisStreamsSourceReader.class);
     private final Map<String, KinesisShardMetrics> shardMetricGroupMap;
+    private ScheduledExecutorService logScheduler;
 
     public KinesisStreamsSourceReader(
             SingleThreadFetcherManager<Record, KinesisShardSplit> splitFetcherManager,
@@ -58,6 +62,11 @@ public class KinesisStreamsSourceReader<T>
             Map<String, KinesisShardMetrics> shardMetricGroupMap) {
         super(splitFetcherManager, recordEmitter, config, context);
         this.shardMetricGroupMap = shardMetricGroupMap;
+
+        // Start a scheduled task to log elementsQueue capacity
+        this.logScheduler = new ScheduledThreadPoolExecutor(1);
+        this.logScheduler.scheduleAtFixedRate(
+                this::logElementsQueueCapacity, 0, 5, TimeUnit.SECONDS);
     }
 
     @Override
@@ -83,8 +92,42 @@ public class KinesisStreamsSourceReader<T>
         super.addSplits(splits);
     }
 
+    /**
+     * Logs the capacity of the elementsQueue.
+     */
+    private void logElementsQueueCapacity() {
+        // Access the elementsQueue through the splitFetcherManager
+        if (splitFetcherManager != null) {
+            try {
+                // Get the queue from the splitFetcherManager
+                org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue<?> queue =
+                        splitFetcherManager.getQueue();
+                if (queue != null) {
+                    LOG.warn(
+                            "NVH: elementsQueue [consumer] - size: {}, remaining: {}, capacity: {}",
+                            queue.size(),
+                            queue.remainingCapacity(),
+                            queue.size() + queue.remainingCapacity());
+                }
+            } catch (Exception e) {
+                LOG.warn("Error logging elementsQueue capacity", e);
+            }
+        }
+    }
+
     @Override
     public void close() throws Exception {
+        if (logScheduler != null) {
+            logScheduler.shutdown();
+            try {
+                if (!logScheduler.awaitTermination(1, TimeUnit.SECONDS)) {
+                    logScheduler.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                logScheduler.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
         super.close();
         this.shardMetricGroupMap.keySet().forEach(this::unregisterShardMetricGroup);
     }
