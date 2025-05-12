@@ -50,6 +50,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -71,6 +72,12 @@ public class FanOutKinesisShardSubscription {
                     IOException.class,
                     LimitExceededException.class);
 
+    // Define constants for queue capacity
+    private static final int QUEUE_CAPACITY = 2;
+
+    // Define constant for maximum outstanding requests - match queue capacity
+    private static final int MAX_OUTSTANDING_REQUESTS = QUEUE_CAPACITY;
+
     private final AsyncStreamProxy kinesis;
     private final String consumerArn;
     private final String shardId;
@@ -79,7 +86,10 @@ public class FanOutKinesisShardSubscription {
 
     // Queue is meant for eager retrieval of records from the Kinesis stream. We will always have 2
     // record batches available on next read.
-    private final BlockingQueue<SubscribeToShardEvent> eventQueue = new LinkedBlockingQueue<>(2);
+    private final BlockingQueue<SubscribeToShardEvent> eventQueue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
+
+    // Track outstanding requests
+    private final AtomicInteger outstandingRequests = new AtomicInteger(0);
     private final AtomicBoolean subscriptionActive = new AtomicBoolean(false);
     private final AtomicReference<Throwable> subscriptionException = new AtomicReference<>();
 
@@ -245,7 +255,27 @@ public class FanOutKinesisShardSubscription {
             return null;
         }
 
-        return eventQueue.poll();
+        // Get the next event
+        SubscribeToShardEvent event = eventQueue.poll();
+
+        // If we got an event, request more records
+        if (event != null) {
+            // Request more records from the consumer thread
+            shardSubscriber.requestRecords();
+
+            // Log queue size for monitoring
+            // int currentSize = eventQueue.size();
+            // int highWaterMark = (int) Math.ceil(QUEUE_CAPACITY * 0.8); // 80% of capacity
+            // int lowWaterMark = (int) Math.ceil(QUEUE_CAPACITY * 0.5);  // 50% of capacity
+
+            // if (currentSize >= highWaterMark) {
+            //     LOG.info("NVH: Queue size {} at or above high water mark {}", currentSize, highWaterMark);
+            // } else if (currentSize <= lowWaterMark) {
+            //     LOG.info("NVH: Queue size {} at or below low water mark {}", currentSize, lowWaterMark);
+            // }
+        }
+
+        return event;
     }
 
     /**
@@ -262,7 +292,14 @@ public class FanOutKinesisShardSubscription {
         }
 
         public void requestRecords() {
-            subscription.request(1);
+            // Only request if we're below the threshold
+            if (outstandingRequests.get() < MAX_OUTSTANDING_REQUESTS) {
+                outstandingRequests.incrementAndGet();
+                subscription.request(1);
+                LOG.debug("Requested record. Outstanding requests: {}", outstandingRequests.get());
+            } else {
+                LOG.debug("Skipped requesting record. Outstanding requests at limit: {}", outstandingRequests.get());
+            }
         }
 
         public void cancel() {
@@ -298,6 +335,11 @@ public class FanOutKinesisShardSubscription {
                                         "Received event: {}, {}",
                                         event.getClass().getSimpleName(),
                                         event);
+
+                                // Decrement outstanding requests counter when we receive an event
+                                outstandingRequests.decrementAndGet();
+
+                                // Still using put() as requested
                                 eventQueue.put(event);
 
                                 // Update the starting position in case we have to recreate the
@@ -306,8 +348,7 @@ public class FanOutKinesisShardSubscription {
                                         StartingPosition.continueFromSequenceNumber(
                                                 event.continuationSequenceNumber());
 
-                                // Replace the record just consumed in the Queue
-                                requestRecords();
+                                // No requestRecords() call here anymore
                             } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
                                 throw new KinesisStreamsSourceException(
