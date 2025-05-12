@@ -71,15 +71,25 @@ public class FanOutKinesisShardSubscription {
                     IOException.class,
                     LimitExceededException.class);
 
+    // Define constants for queue capacity and water marks
+    private static final int QUEUE_CAPACITY = 10;
+    private static final int HIGH_WATER_MARK_PERCENT = 80;
+    private static final int LOW_WATER_MARK_PERCENT = 60;
+    private static final int HIGH_WATER_MARK = QUEUE_CAPACITY * HIGH_WATER_MARK_PERCENT / 100; // 8
+    private static final int LOW_WATER_MARK = QUEUE_CAPACITY * LOW_WATER_MARK_PERCENT / 100;   // 6
+
     private final AsyncStreamProxy kinesis;
     private final String consumerArn;
     private final String shardId;
 
     private final Duration subscriptionTimeout;
 
-    // Queue is meant for eager retrieval of records from the Kinesis stream. We will always have 2
+    // Queue is meant for eager retrieval of records from the Kinesis stream. We will always have 10
     // record batches available on next read.
-    private final BlockingQueue<SubscribeToShardEvent> eventQueue = new LinkedBlockingQueue<>(2);
+    private final BlockingQueue<SubscribeToShardEvent> eventQueue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
+
+    // Add flag to track yielding state
+    private volatile boolean isYielding = false;
     private final AtomicBoolean subscriptionActive = new AtomicBoolean(false);
     private final AtomicReference<Throwable> subscriptionException = new AtomicReference<>();
 
@@ -298,22 +308,54 @@ public class FanOutKinesisShardSubscription {
                                         "Received event: {}, {}",
                                         event.getClass().getSimpleName(),
                                         event);
-                                eventQueue.put(event);
 
-                                // Update the starting position in case we have to recreate the
-                                // subscription
-                                startingPosition =
-                                        StartingPosition.continueFromSequenceNumber(
-                                                event.continuationSequenceNumber());
+                                int currentSize = eventQueue.size();
+                                // Check if we need to start yielding (queue size is at or above 80% capacity)
+                                if (currentSize >= HIGH_WATER_MARK) {
+                                    isYielding = true;
+                                    LOG.info("NVH: Queue size {} reached high water mark {}. Starting to yield.",
+                                             currentSize, HIGH_WATER_MARK);
+                                }
 
-                                // Replace the record just consumed in the Queue
-                                requestRecords();
+                                // Execute the critical path
+                                executeCriticalPath(event);
+
+                                // If we're yielding, yield the thread until queue size drops below 50% capacity
+                                if (isYielding) {
+                                    int yieldCount = 0;
+                                    while (eventQueue.size() > LOW_WATER_MARK) {
+                                        Thread.yield();
+                                        yieldCount++;
+
+                                        // Log every 10000 yields to avoid excessive logging
+                                        if (yieldCount % 10000 == 0) {
+                                            LOG.info("NVH: Still yielding after {} yields. Current queue size: {}, target: {}",
+                                                     yieldCount, eventQueue.size(), LOW_WATER_MARK);
+                                        }
+                                    }
+                                    LOG.info("NVH: Stopped yielding after {} yields. Queue size {} is now below low water mark {}",
+                                             yieldCount, eventQueue.size(), LOW_WATER_MARK);
+                                    isYielding = false;
+                                }
                             } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
                                 throw new KinesisStreamsSourceException(
                                         "Interrupted while adding Kinesis record to internal buffer.",
                                         e);
                             }
+                        }
+
+                        // Helper method to encapsulate the critical path
+                        private void executeCriticalPath(SubscribeToShardEvent event) throws InterruptedException {
+                            // 1. Put the event in the queue
+                            eventQueue.put(event);
+
+                            // 2. Update the starting position
+                            startingPosition = StartingPosition.continueFromSequenceNumber(
+                                    event.continuationSequenceNumber());
+
+                            // 3. Replace the record just consumed in the Queue
+                            requestRecords();
                         }
                     });
         }
