@@ -76,7 +76,7 @@ public class FanOutKinesisShardSubscription {
     private static final int QUEUE_CAPACITY = 2;
 
     // Define constant for maximum outstanding requests - match queue capacity
-    private static final int MAX_OUTSTANDING_REQUESTS = QUEUE_CAPACITY;
+    private static final int MAX_OUTSTANDING_REQUESTS = 5;
 
     private final AsyncStreamProxy kinesis;
     private final String consumerArn;
