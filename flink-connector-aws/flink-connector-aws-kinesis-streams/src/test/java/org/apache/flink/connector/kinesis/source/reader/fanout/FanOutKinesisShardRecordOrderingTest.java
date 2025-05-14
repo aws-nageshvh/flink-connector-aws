@@ -23,28 +23,21 @@ import org.apache.flink.connector.base.source.reader.splitreader.SplitsAddition;
 import org.apache.flink.connector.kinesis.source.proxy.AsyncStreamProxy;
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplit;
 import org.apache.flink.connector.kinesis.source.split.StartingPosition;
-import org.apache.flink.connector.kinesis.source.util.TestUtil;
 
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.mockito.Mockito;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
-import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.services.kinesis.model.Record;
 import software.amazon.awssdk.services.kinesis.model.SubscribeToShardEvent;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -61,23 +54,7 @@ import static org.mockito.Mockito.when;
  * Tests to verify that there's no dropping of records or change in order of records
  * when processing events in {@link FanOutKinesisShardSubscription} and {@link FanOutKinesisShardSplitReader}.
  */
-public class FanOutKinesisShardRecordOrderingTest {
-
-    private static final Duration TEST_SUBSCRIPTION_TIMEOUT = Duration.ofMillis(1000);
-    private static final String SHARD_ID_1 = "shardId-000000000001";
-    private static final String SHARD_ID_2 = "shardId-000000000002";
-
-    private AsyncStreamProxy mockAsyncStreamProxy;
-    private ExecutorService testExecutor;
-
-    @BeforeEach
-    public void setUp() {
-        mockAsyncStreamProxy = Mockito.mock(AsyncStreamProxy.class);
-        when(mockAsyncStreamProxy.subscribeToShard(any(), any(), any(), any()))
-                .thenReturn(CompletableFuture.completedFuture(null));
-
-        testExecutor = Executors.newFixedThreadPool(4);
-    }
+public class FanOutKinesisShardRecordOrderingTest extends FanOutKinesisShardTestBase {
 
     /**
      * Tests that records are processed in the correct order for a single shard.
@@ -89,13 +66,9 @@ public class FanOutKinesisShardRecordOrderingTest {
         BlockingQueue<Record> processedRecords = new LinkedBlockingQueue<>();
 
         // Create a custom TestableSubscription that captures processed records
-        TestableSubscription testSubscription = new TestableSubscription(
-                mockAsyncStreamProxy,
-                CONSUMER_ARN,
+        TestableSubscription testSubscription = createTestableSubscription(
                 SHARD_ID,
                 StartingPosition.fromStart(),
-                TEST_SUBSCRIPTION_TIMEOUT,
-                testExecutor,
                 processedRecords);
 
         // Create test events with records in a specific order
@@ -107,7 +80,7 @@ public class FanOutKinesisShardRecordOrderingTest {
             List<Record> records = new ArrayList<>();
             for (int j = 0; j < recordsPerEvent; j++) {
                 int recordNum = i * recordsPerEvent + j;
-                records.add(createTestRecord("record-" + recordNum));
+                records.add(FanOutKinesisTestUtils.createTestRecord("record-" + recordNum));
             }
             eventRecords.add(records);
         }
@@ -116,7 +89,7 @@ public class FanOutKinesisShardRecordOrderingTest {
         for (int i = 0; i < numEvents; i++) {
             String sequenceNumber = "sequence-" + i;
             testSubscription.processSubscriptionEvent(
-                    createTestEvent(sequenceNumber, eventRecords.get(i)));
+                    FanOutKinesisTestUtils.createTestEvent(sequenceNumber, eventRecords.get(i)));
         }
 
         // Verify that all records were processed in the correct order
@@ -146,22 +119,14 @@ public class FanOutKinesisShardRecordOrderingTest {
         BlockingQueue<Record> processedRecordsShard2 = new LinkedBlockingQueue<>();
 
         // Create custom TestableSubscriptions for each shard
-        TestableSubscription subscription1 = new TestableSubscription(
-                mockAsyncStreamProxy,
-                CONSUMER_ARN,
+        TestableSubscription subscription1 = createTestableSubscription(
                 SHARD_ID_1,
                 StartingPosition.fromStart(),
-                TEST_SUBSCRIPTION_TIMEOUT,
-                testExecutor,
                 processedRecordsShard1);
 
-        TestableSubscription subscription2 = new TestableSubscription(
-                mockAsyncStreamProxy,
-                CONSUMER_ARN,
+        TestableSubscription subscription2 = createTestableSubscription(
                 SHARD_ID_2,
                 StartingPosition.fromStart(),
-                TEST_SUBSCRIPTION_TIMEOUT,
-                testExecutor,
                 processedRecordsShard2);
 
         // Create test events with records in a specific order for each shard
@@ -173,12 +138,12 @@ public class FanOutKinesisShardRecordOrderingTest {
             List<Record> records = new ArrayList<>();
             for (int j = 0; j < recordsPerEvent; j++) {
                 int recordNum = i * recordsPerEvent + j;
-                records.add(createTestRecord("shard1-record-" + recordNum));
+                records.add(FanOutKinesisTestUtils.createTestRecord("shard1-record-" + recordNum));
             }
 
             String sequenceNumber = "shard1-sequence-" + i;
             subscription1.processSubscriptionEvent(
-                    createTestEvent(sequenceNumber, records));
+                    FanOutKinesisTestUtils.createTestEvent(sequenceNumber, records));
         }
 
         // Process events for shard 2
@@ -186,12 +151,12 @@ public class FanOutKinesisShardRecordOrderingTest {
             List<Record> records = new ArrayList<>();
             for (int j = 0; j < recordsPerEvent; j++) {
                 int recordNum = i * recordsPerEvent + j;
-                records.add(createTestRecord("shard2-record-" + recordNum));
+                records.add(FanOutKinesisTestUtils.createTestRecord("shard2-record-" + recordNum));
             }
 
             String sequenceNumber = "shard2-sequence-" + i;
             subscription2.processSubscriptionEvent(
-                    createTestEvent(sequenceNumber, records));
+                    FanOutKinesisTestUtils.createTestEvent(sequenceNumber, records));
         }
 
         // Verify that all records were processed in the correct order for shard 1
@@ -255,13 +220,9 @@ public class FanOutKinesisShardRecordOrderingTest {
                                     SubscribeToShardEvent event = eventQueue.poll(100, TimeUnit.MILLISECONDS);
                                     if (event != null) {
                                         // Create a TestableSubscription to process the event
-                                        TestableSubscription subscription = new TestableSubscription(
-                                                customProxy,
-                                                CONSUMER_ARN,
+                                        TestableSubscription subscription = createTestableSubscription(
                                                 SHARD_ID,
                                                 StartingPosition.fromStart(),
-                                                TEST_SUBSCRIPTION_TIMEOUT,
-                                                testExecutor,
                                                 new LinkedBlockingQueue<>());
 
                                         // Process the event directly
@@ -292,13 +253,10 @@ public class FanOutKinesisShardRecordOrderingTest {
                 TEST_SUBSCRIPTION_TIMEOUT);
 
         // Add a split to the reader
-        KinesisShardSplit split = new KinesisShardSplit(
+        KinesisShardSplit split = FanOutKinesisTestUtils.createTestSplit(
                 STREAM_ARN,
                 SHARD_ID,
-                StartingPosition.fromStart(),
-                Collections.emptySet(),
-                TestUtil.STARTING_HASH_KEY_TEST_VALUE,
-                TestUtil.ENDING_HASH_KEY_TEST_VALUE);
+                StartingPosition.fromStart());
 
         customReader.handleSplitsChanges(new SplitsAddition<>(Collections.singletonList(split)));
 
@@ -311,13 +269,13 @@ public class FanOutKinesisShardRecordOrderingTest {
             List<Record> records = new ArrayList<>();
             for (int j = 0; j < recordsPerEvent; j++) {
                 int recordNum = i * recordsPerEvent + j;
-                Record record = createTestRecord("record-" + recordNum);
+                Record record = FanOutKinesisTestUtils.createTestRecord("record-" + recordNum);
                 records.add(record);
                 allRecords.add(record);
             }
 
             String sequenceNumber = "sequence-" + i;
-            eventQueue.add(createTestEvent(sequenceNumber, records));
+            eventQueue.add(FanOutKinesisTestUtils.createTestEvent(sequenceNumber, records));
         }
 
         AtomicInteger fetchAttempts = new AtomicInteger(0);
@@ -375,13 +333,9 @@ public class FanOutKinesisShardRecordOrderingTest {
         BlockingQueue<Record> processedRecords = new LinkedBlockingQueue<>();
 
         // Create a custom TestableSubscription that captures processed records
-        TestableSubscription testSubscription = new TestableSubscription(
-                mockAsyncStreamProxy,
-                CONSUMER_ARN,
+        TestableSubscription testSubscription = createTestableSubscription(
                 SHARD_ID,
                 StartingPosition.fromStart(),
-                TEST_SUBSCRIPTION_TIMEOUT,
-                testExecutor,
                 processedRecords);
 
         // Create test events with records
@@ -393,11 +347,11 @@ public class FanOutKinesisShardRecordOrderingTest {
             List<Record> records = new ArrayList<>();
             for (int j = 0; j < recordsPerEvent; j++) {
                 int recordNum = i * recordsPerEvent + j;
-                records.add(createTestRecord("record-" + recordNum));
+                records.add(FanOutKinesisTestUtils.createTestRecord("record-" + recordNum));
             }
 
             String sequenceNumber = "sequence-" + i;
-            events.add(createTestEvent(sequenceNumber, records));
+            events.add(FanOutKinesisTestUtils.createTestEvent(sequenceNumber, records));
         }
 
         // Process events concurrently
@@ -457,100 +411,5 @@ public class FanOutKinesisShardRecordOrderingTest {
 
         // We expect records from the same event to be in order
         assertThat(recordsInOrder).as("Records from the same event should be processed in order").isTrue();
-    }
-
-    /**
-     * Creates a FanOutKinesisShardSplitReader with a single shard.
-     */
-    private FanOutKinesisShardSplitReader createSplitReaderWithShard(String shardId) {
-        FanOutKinesisShardSplitReader reader = new FanOutKinesisShardSplitReader(
-                mockAsyncStreamProxy,
-                CONSUMER_ARN,
-                Collections.emptyMap(),
-                TEST_SUBSCRIPTION_TIMEOUT);
-
-        // Create a split
-        KinesisShardSplit split = new KinesisShardSplit(
-                STREAM_ARN,
-                shardId,
-                StartingPosition.fromStart(),
-                Collections.emptySet(),
-                TestUtil.STARTING_HASH_KEY_TEST_VALUE,
-                TestUtil.ENDING_HASH_KEY_TEST_VALUE);
-
-        // Add the split to the reader
-        reader.handleSplitsChanges(new SplitsAddition<>(Collections.singletonList(split)));
-
-        return reader;
-    }
-
-    /**
-     * Creates a test Record with the given data.
-     */
-    private Record createTestRecord(String data) {
-        return Record.builder()
-                .data(SdkBytes.fromString(data, StandardCharsets.UTF_8))
-                .approximateArrivalTimestamp(Instant.now())
-                .partitionKey("partitionKey")
-                .sequenceNumber("sequenceNumber")
-                .build();
-    }
-
-    /**
-     * Creates a test SubscribeToShardEvent with the given continuation sequence number and records.
-     */
-    private SubscribeToShardEvent createTestEvent(String continuationSequenceNumber, List<Record> records) {
-        return SubscribeToShardEvent.builder()
-                .continuationSequenceNumber(continuationSequenceNumber)
-                .millisBehindLatest(0L)
-                .records(records)
-                .build();
-    }
-
-    /**
-     * A testable version of FanOutKinesisShardSubscription that captures processed records.
-     */
-    private static class TestableSubscription extends FanOutKinesisShardSubscription {
-        private final BlockingQueue<Record> recordQueue;
-        private volatile StartingPosition currentStartingPosition;
-
-        public TestableSubscription(
-                AsyncStreamProxy kinesis,
-                String consumerArn,
-                String shardId,
-                StartingPosition startingPosition,
-                Duration subscriptionTimeout,
-                ExecutorService subscriptionEventProcessingExecutor,
-                BlockingQueue<Record> recordQueue) {
-            super(kinesis, consumerArn, shardId, startingPosition, subscriptionTimeout, subscriptionEventProcessingExecutor);
-            this.recordQueue = recordQueue;
-            this.currentStartingPosition = startingPosition;
-        }
-
-        @Override
-        public StartingPosition getStartingPosition() {
-            return currentStartingPosition;
-        }
-
-        @Override
-        public void processSubscriptionEvent(SubscribeToShardEvent event) {
-            try {
-                // Add all records to the queue
-                if (recordQueue != null && event.records() != null) {
-                    for (Record record : event.records()) {
-                        recordQueue.put(record);
-                    }
-                }
-
-                // Update the starting position
-                String continuationSequenceNumber = event.continuationSequenceNumber();
-                if (continuationSequenceNumber != null) {
-                    currentStartingPosition = StartingPosition.continueFromSequenceNumber(continuationSequenceNumber);
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException("Interrupted while processing event", e);
-            }
-        }
     }
 }

@@ -23,30 +23,17 @@ import org.apache.flink.connector.kinesis.source.metrics.KinesisShardMetrics;
 import org.apache.flink.connector.kinesis.source.proxy.AsyncStreamProxy;
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplit;
 import org.apache.flink.connector.kinesis.source.split.StartingPosition;
-import org.apache.flink.connector.kinesis.source.util.TestUtil;
-import org.apache.flink.metrics.MetricGroup;
 
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
-import software.amazon.awssdk.core.SdkBytes;
-import software.amazon.awssdk.services.kinesis.model.Record;
-import software.amazon.awssdk.services.kinesis.model.ResourceNotFoundException;
-import software.amazon.awssdk.services.kinesis.model.SubscribeToShardEvent;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import java.time.Instant;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeoutException;
 
 import static org.apache.flink.connector.kinesis.source.util.TestUtil.CONSUMER_ARN;
@@ -55,7 +42,6 @@ import static org.apache.flink.connector.kinesis.source.util.TestUtil.STREAM_ARN
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -64,26 +50,7 @@ import static org.mockito.Mockito.when;
  * Tests for the restart behavior in {@link FanOutKinesisShardSubscription}
  * and {@link FanOutKinesisShardSplitReader}.
  */
-public class FanOutKinesisShardRestartTest {
-
-    private static final Duration TEST_SUBSCRIPTION_TIMEOUT = Duration.ofMillis(1000);
-
-    private AsyncStreamProxy mockAsyncStreamProxy;
-    private ExecutorService testExecutor;
-    private MetricGroup mockMetricGroup;
-
-    @BeforeEach
-    public void setUp() {
-        mockAsyncStreamProxy = Mockito.mock(AsyncStreamProxy.class);
-        when(mockAsyncStreamProxy.subscribeToShard(any(), any(), any(), any()))
-                .thenReturn(CompletableFuture.completedFuture(null));
-
-        testExecutor = Executors.newFixedThreadPool(4);
-
-        mockMetricGroup = mock(MetricGroup.class);
-        when(mockMetricGroup.addGroup(any(String.class))).thenReturn(mockMetricGroup);
-        when(mockMetricGroup.addGroup(any(String.class), any(String.class))).thenReturn(mockMetricGroup);
-    }
+public class FanOutKinesisShardRestartTest extends FanOutKinesisShardTestBase {
 
     /**
      * Tests that when a restart happens, the correct starting position is used to reactivate the subscription.
@@ -104,13 +71,10 @@ public class FanOutKinesisShardRestartTest {
 
         // Create a metrics map for the shard
         Map<String, KinesisShardMetrics> metricsMap = new HashMap<>();
-        KinesisShardSplit split = new KinesisShardSplit(
+        KinesisShardSplit split = FanOutKinesisTestUtils.createTestSplit(
                 STREAM_ARN,
                 SHARD_ID,
-                StartingPosition.fromStart(),
-                Collections.emptySet(),
-                TestUtil.STARTING_HASH_KEY_TEST_VALUE,
-                TestUtil.ENDING_HASH_KEY_TEST_VALUE);
+                StartingPosition.fromStart());
         metricsMap.put(SHARD_ID, new KinesisShardMetrics(split, mockMetricGroup));
 
         // Create a reader
@@ -135,13 +99,10 @@ public class FanOutKinesisShardRestartTest {
         // Create a new split with the updated starting position
         String continuationSequenceNumber = "sequence-after-processing";
         StartingPosition updatedPosition = StartingPosition.continueFromSequenceNumber(continuationSequenceNumber);
-        KinesisShardSplit updatedSplit = new KinesisShardSplit(
+        KinesisShardSplit updatedSplit = FanOutKinesisTestUtils.createTestSplit(
                 STREAM_ARN,
                 SHARD_ID,
-                updatedPosition,
-                Collections.emptySet(),
-                TestUtil.STARTING_HASH_KEY_TEST_VALUE,
-                TestUtil.ENDING_HASH_KEY_TEST_VALUE);
+                updatedPosition);
 
         // Simulate a restart by creating a new reader with the updated split
         FanOutKinesisShardSplitReader restartedReader = new FanOutKinesisShardSplitReader(
@@ -176,17 +137,14 @@ public class FanOutKinesisShardRestartTest {
     public void testExceptionsProperlyHandled() throws Exception {
         // Create a metrics map for the shard
         Map<String, KinesisShardMetrics> metricsMap = new HashMap<>();
-        KinesisShardSplit split = new KinesisShardSplit(
+        KinesisShardSplit split = FanOutKinesisTestUtils.createTestSplit(
                 STREAM_ARN,
                 SHARD_ID,
-                StartingPosition.fromStart(),
-                Collections.emptySet(),
-                TestUtil.STARTING_HASH_KEY_TEST_VALUE,
-                TestUtil.ENDING_HASH_KEY_TEST_VALUE);
+                StartingPosition.fromStart());
         metricsMap.put(SHARD_ID, new KinesisShardMetrics(split, mockMetricGroup));
 
         // Test with different types of exceptions
-        testExceptionHandling(ResourceNotFoundException.builder().message("Resource not found").build(), true);
+        testExceptionHandling(software.amazon.awssdk.services.kinesis.model.ResourceNotFoundException.builder().message("Resource not found").build(), true);
         testExceptionHandling(new IOException("IO exception"), true);
         testExceptionHandling(new TimeoutException("Timeout"), true);
         testExceptionHandling(new RuntimeException("Runtime exception"), false);
@@ -198,13 +156,10 @@ public class FanOutKinesisShardRestartTest {
     private void testExceptionHandling(Exception exception, boolean isRecoverable) throws Exception {
         // Create a metrics map for the shard
         Map<String, KinesisShardMetrics> metricsMap = new HashMap<>();
-        KinesisShardSplit split = new KinesisShardSplit(
+        KinesisShardSplit split = FanOutKinesisTestUtils.createTestSplit(
                 STREAM_ARN,
                 SHARD_ID,
-                StartingPosition.fromStart(),
-                Collections.emptySet(),
-                TestUtil.STARTING_HASH_KEY_TEST_VALUE,
-                TestUtil.ENDING_HASH_KEY_TEST_VALUE);
+                StartingPosition.fromStart());
         metricsMap.put(SHARD_ID, new KinesisShardMetrics(split, mockMetricGroup));
 
         // Create a mock AsyncStreamProxy that throws the specified exception
@@ -243,52 +198,5 @@ public class FanOutKinesisShardRestartTest {
                     any(),
                     any());
         }
-    }
-
-    /**
-     * Gets the subscription for a specific shard from the reader using reflection.
-     */
-    private FanOutKinesisShardSubscription getSubscriptionFromReader(
-            FanOutKinesisShardSplitReader reader, String shardId) throws Exception {
-        // Get access to the subscriptions map
-        java.lang.reflect.Field field = FanOutKinesisShardSplitReader.class.getDeclaredField("splitSubscriptions");
-        field.setAccessible(true);
-        Map<String, FanOutKinesisShardSubscription> subscriptions =
-                (Map<String, FanOutKinesisShardSubscription>) field.get(reader);
-        return subscriptions.get(shardId);
-    }
-
-    /**
-     * Sets the starting position in a subscription using reflection.
-     */
-    private void setStartingPositionInSubscription(
-            FanOutKinesisShardSubscription subscription, StartingPosition startingPosition) throws Exception {
-        // Get access to the currentStartingPosition field
-        java.lang.reflect.Field field = subscription.getClass().getDeclaredField("startingPosition");
-        field.setAccessible(true);
-        field.set(subscription, startingPosition);
-    }
-
-    /**
-     * Creates a test Record with the given data.
-     */
-    private Record createTestRecord(String data) {
-        return Record.builder()
-                .data(SdkBytes.fromString(data, StandardCharsets.UTF_8))
-                .approximateArrivalTimestamp(Instant.now())
-                .partitionKey("partitionKey")
-                .sequenceNumber("sequenceNumber")
-                .build();
-    }
-
-    /**
-     * Creates a test SubscribeToShardEvent with the given continuation sequence number and records.
-     */
-    private SubscribeToShardEvent createTestEvent(String continuationSequenceNumber, List<Record> records) {
-        return SubscribeToShardEvent.builder()
-                .continuationSequenceNumber(continuationSequenceNumber)
-                .millisBehindLatest(0L)
-                .records(records)
-                .build();
     }
 }
